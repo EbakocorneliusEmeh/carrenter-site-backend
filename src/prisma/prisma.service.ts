@@ -1,11 +1,10 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { execFileSync } from 'child_process';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { randomUUID } from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import { DealerStatus } from '../common/enums/dealer-status.enum';
+import { BusinessPageStatus } from '../common/enums/business-page-status.enum';
 import { Role } from '../common/enums/role.enum';
-
-type QueryResultRow = Record<string, string | null>;
 
 type UserRecord = {
   id: string;
@@ -44,6 +43,18 @@ type DealerProfileRecord = {
   updatedAt: string;
 };
 
+type BusinessPageRecord = {
+  id: string;
+  userId: string;
+  businessName: string;
+  slug: string;
+  description: string | null;
+  pagePasswordHash: string | null;
+  status: BusinessPageStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type SelectShape = Record<string, boolean>;
 
 type UserCreateInput = {
@@ -65,6 +76,21 @@ type DealerProfileCreateInput = {
   status?: DealerStatus;
 };
 
+type BusinessPageCreateInput = {
+  userId: string;
+  businessName: string;
+  slug: string;
+  description?: string | null;
+  pagePasswordHash?: string | null;
+  status?: BusinessPageStatus;
+};
+
+type BusinessPageUpdateInput = Partial<BusinessPageCreateInput>;
+
+type BusinessPageFindUniqueArgs = {
+  where: { id?: string; slug?: string; userId?: string };
+};
+
 type FindUniqueArgs = {
   where: { id?: string; email?: string; phone?: string };
   select?: SelectShape;
@@ -79,76 +105,60 @@ type CreateArgs<T> = {
   data: T;
 };
 
-const USER_SELECT_COLUMNS = [
-  'id',
-  'email',
-  'phone',
-  'password_hash',
-  'role',
-  'is_verified',
-  'refresh_token',
-  'password_reset_token_hash',
-  'password_reset_token_expires_at',
-  'created_at',
-  'updated_at',
-].join(', ');
-
 @Injectable()
 export class PrismaService implements OnModuleInit, OnModuleDestroy {
-  private transactionStatements: string[] | null = null;
+  private readonly supabase: SupabaseClient;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(private readonly config: ConfigService) {
+    const url = this.config.get<string>('SUPABASE_URL');
+    const key = this.config.get<string>('SUPABASE_SECRET_KEY');
+
+    if (!url || !key) {
+      throw new Error('Supabase configuration is not set');
+    }
+
+    this.supabase = createClient(url, key);
+  }
 
   user = {
     findUnique: async (args: FindUniqueArgs): Promise<any> => {
-      const whereClause = this.buildWhereClause(args.where);
-      const rows = await this.queryRows(
-        `select ${USER_SELECT_COLUMNS} from users where ${whereClause} limit 1`,
-      );
-      const row = rows[0];
-      if (!row) {
-        return null;
+      const query = this.supabase.from('users').select('*');
+      if (args.where.id) query.eq('id', args.where.id);
+      if (args.where.email) query.eq('email', args.where.email);
+      if (args.where.phone) query.eq('phone', args.where.phone);
+      if (!args.where.id && !args.where.email && !args.where.phone) {
+        throw new Error('No where clause provided');
       }
-      return await this.applyUserSelect(this.mapUserRow(row), args.select);
+
+      const { data, error } = await query.maybeSingle();
+      if (error) {
+        throw new Error(error.message);
+      }
+      if (!data) return null;
+      return await this.applyUserSelect(this.mapUserRow(data), args.select);
     },
 
     create: async ({ data }: CreateArgs<UserCreateInput>): Promise<any> => {
       const now = new Date().toISOString();
-      const user: UserRecord = {
+      const row = {
         id: randomUUID(),
         email: data.email,
         phone: data.phone,
-        passwordHash: data.passwordHash,
+        password_hash: data.passwordHash,
         role: data.role,
-        isVerified: data.isVerified ?? false,
-        refreshToken: null,
-        passwordResetTokenHash: null,
-        passwordResetTokenExpiresAt: null,
-        createdAt: now,
-        updatedAt: now,
+        is_verified: data.isVerified ?? false,
+        refresh_token: null,
+        password_reset_token_hash: null,
+        password_reset_token_expires_at: null,
+        created_at: now,
+        updated_at: now,
       };
 
-      const sql = `
-        insert into users (
-          id, email, phone, password_hash, role, is_verified,
-          refresh_token, password_reset_token_hash, password_reset_token_expires_at,
-          created_at, updated_at
-        ) values (
-          ${this.literal(user.id)},
-          ${this.literal(user.email)},
-          ${this.literal(user.phone)},
-          ${this.literal(user.passwordHash)},
-          ${this.literal(user.role)},
-          ${user.isVerified},
-          null,
-          null,
-          null,
-          ${this.literal(user.createdAt)},
-          ${this.literal(user.updatedAt)}
-        )
-      `;
-      await this.execute(sql);
-      return this.clone(user);
+      const { data: inserted, error } = await this.supabase.from('users').insert(row).select().single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return this.clone(this.mapUserRow(inserted));
     },
 
     update: async ({ where, data }: UpdateArgs): Promise<any> => {
@@ -157,99 +167,227 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
         throw new Error('User not found');
       }
 
-      const now = new Date().toISOString();
       const updateData = this.mapUserUpdateData(data);
-      const sql = `update users set ${updateData ? `${updateData}, ` : ''}updated_at = ${this.literal(now)} where id = ${this.literal(where.id)}`;
-      await this.execute(sql);
-      return this.user.findUnique({ where: { id: where.id } });
+      if (Object.keys(updateData).length === 0) {
+        return existing;
+      }
+
+      updateData.updated_at = new Date().toISOString();
+      const { data: updated, error } = await this.supabase
+        .from('users')
+        .update(updateData)
+        .eq('id', where.id)
+        .select()
+        .single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return await this.applyUserSelect(this.mapUserRow(updated), undefined);
     },
 
     findByPasswordResetTokenHash: async (tokenHash: string): Promise<any> => {
-      const rows = await this.queryRows(
-        `select ${USER_SELECT_COLUMNS} from users where password_reset_token_hash = ${this.literal(tokenHash)} limit 1`,
-      );
-      const row = rows[0];
-      return row ? await this.applyUserSelect(this.mapUserRow(row)) : null;
+      const { data, error } = await this.supabase
+        .from('users')
+        .select('*')
+        .eq('password_reset_token_hash', tokenHash)
+        .maybeSingle();
+      if (error) {
+        throw new Error(error.message);
+      }
+      if (!data) return null;
+      return await this.applyUserSelect(this.mapUserRow(data));
     },
   };
 
   customerProfile = {
     create: async ({ data }: CreateArgs<CustomerProfileCreateInput>): Promise<any> => {
       const now = new Date().toISOString();
-      const record: CustomerProfileRecord = {
+      const record = {
         id: randomUUID(),
-        userId: data.userId,
-        fullName: data.fullName,
+        user_id: data.userId,
+        full_name: data.fullName,
         address: null,
-        profilePhoto: null,
-        driverLicenseFrontImage: null,
-        driverLicenseBackImage: null,
-        createdAt: now,
-        updatedAt: now,
+        profile_photo: null,
+        driver_license_front_image: null,
+        driver_license_back_image: null,
+        created_at: now,
+        updated_at: now,
       };
 
-      const sql = `
-        insert into customer_profiles (
-          id, user_id, full_name, address, profile_photo,
-          driver_license_front_image, driver_license_back_image,
-          created_at, updated_at
-        ) values (
-          ${this.literal(record.id)},
-          ${this.literal(record.userId)},
-          ${this.literal(record.fullName)},
-          null,
-          null,
-          null,
-          null,
-          ${this.literal(record.createdAt)},
-          ${this.literal(record.updatedAt)}
-        )
-      `;
-      await this.execute(sql);
-      return this.clone(record);
+      const { data: inserted, error } = await this.supabase
+        .from('customer_profiles')
+        .insert(record)
+        .select()
+        .single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return this.clone(inserted);
     },
   };
 
   dealerProfile = {
     findUnique: async (args: { where: { userId: string } }): Promise<any> => {
-      const rows = await this.queryRows(
-        `select id, user_id, business_name, status, created_at, updated_at from dealer_profiles where user_id = ${this.literal(args.where.userId)} limit 1`,
-      );
-      const row = rows[0];
-      return row ? this.mapDealerProfileRow(row) : null;
+      const { data, error } = await this.supabase
+        .from('dealer_profiles')
+        .select('*')
+        .eq('user_id', args.where.userId)
+        .maybeSingle();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return data ? this.mapDealerProfileRow(data) : null;
     },
 
     create: async ({ data }: CreateArgs<DealerProfileCreateInput>): Promise<any> => {
       const now = new Date().toISOString();
-      const record: DealerProfileRecord = {
+      const record = {
         id: randomUUID(),
-        userId: data.userId,
-        businessName: data.businessName,
+        user_id: data.userId,
+        business_name: data.businessName,
         status: data.status ?? DealerStatus.PENDING_APPROVAL,
-        createdAt: now,
-        updatedAt: now,
+        created_at: now,
+        updated_at: now,
       };
 
-      const sql = `
-        insert into dealer_profiles (
-          id, user_id, business_name, status, created_at, updated_at
-        ) values (
-          ${this.literal(record.id)},
-          ${this.literal(record.userId)},
-          ${this.literal(record.businessName)},
-          ${this.literal(record.status)},
-          ${this.literal(record.createdAt)},
-          ${this.literal(record.updatedAt)}
-        )
-      `;
-      await this.execute(sql);
-      return this.clone(record);
+      const { data: inserted, error } = await this.supabase
+        .from('dealer_profiles')
+        .insert(record)
+        .select()
+        .single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return this.clone(this.mapDealerProfileRow(inserted));
+    },
+
+    update: async ({ where, data }: { where: { userId: string }; data: Partial<DealerProfileCreateInput> }): Promise<any> => {
+      const existing = await this.dealerProfile.findUnique({ where: { userId: where.userId } });
+      if (!existing) {
+        throw new Error('Dealer profile not found');
+      }
+
+      const updateData: Record<string, unknown> = {};
+      if (data.businessName !== undefined) updateData.business_name = data.businessName;
+      if (data.status !== undefined) updateData.status = data.status;
+      if (Object.keys(updateData).length === 0) {
+        return existing;
+      }
+
+      updateData.updated_at = new Date().toISOString();
+      const { data: updated, error } = await this.supabase
+        .from('dealer_profiles')
+        .update(updateData)
+        .eq('user_id', where.userId)
+        .select()
+        .single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return this.mapDealerProfileRow(updated);
+    },
+  };
+
+  businessPage = {
+    findUnique: async (args: BusinessPageFindUniqueArgs): Promise<any> => {
+      const query = this.supabase.from('business_pages').select('*');
+      if (args.where.id) query.eq('id', args.where.id);
+      if (args.where.slug) query.eq('slug', args.where.slug);
+      if (args.where.userId) query.eq('user_id', args.where.userId);
+      if (!args.where.id && !args.where.slug && !args.where.userId) {
+        throw new Error('No where clause provided');
+      }
+
+      const { data, error } = await query.maybeSingle();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return data ? this.mapBusinessPageRow(data) : null;
+    },
+
+    findManyByUserId: async (userId: string): Promise<any[]> => {
+      const { data, error } = await this.supabase
+        .from('business_pages')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+      if (error) {
+        throw new Error(error.message);
+      }
+      return (data ?? []).map((row: any) => this.mapBusinessPageRow(row));
+    },
+
+    create: async ({ data }: CreateArgs<BusinessPageCreateInput>): Promise<any> => {
+      const now = new Date().toISOString();
+      const record = {
+        id: randomUUID(),
+        user_id: data.userId,
+        business_name: data.businessName,
+        slug: data.slug,
+        description: data.description ?? null,
+        page_password_hash: data.pagePasswordHash ?? null,
+        status: data.status ?? BusinessPageStatus.ACTIVE,
+        created_at: now,
+        updated_at: now,
+      };
+
+      const { data: inserted, error } = await this.supabase
+        .from('business_pages')
+        .insert(record)
+        .select()
+        .single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return this.clone(this.mapBusinessPageRow(inserted));
+    },
+
+    update: async ({ where, data }: { where: { id: string }; data: BusinessPageUpdateInput }): Promise<any> => {
+      const existing = await this.businessPage.findUnique({ where: { id: where.id } });
+      if (!existing) {
+        throw new Error('Business page not found');
+      }
+
+      const updateData: Record<string, unknown> = {};
+      if (data.businessName !== undefined) updateData.business_name = data.businessName;
+      if (data.slug !== undefined) updateData.slug = data.slug;
+      if (data.description !== undefined) updateData.description = data.description;
+      if (data.pagePasswordHash !== undefined) updateData.page_password_hash = data.pagePasswordHash;
+      if (data.status !== undefined) updateData.status = data.status;
+      if (Object.keys(updateData).length === 0) {
+        return existing;
+      }
+
+      updateData.updated_at = new Date().toISOString();
+      const { data: updated, error } = await this.supabase
+        .from('business_pages')
+        .update(updateData)
+        .eq('id', where.id)
+        .select()
+        .single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return this.mapBusinessPageRow(updated);
+    },
+
+    delete: async ({ where: { id } }: { where: { id: string } }): Promise<any> => {
+      const existing = await this.businessPage.findUnique({ where: { id } });
+      if (!existing) {
+        throw new Error('Business page not found');
+      }
+
+      const { error } = await this.supabase.from('business_pages').delete().eq('id', id).single();
+      if (error) {
+        throw new Error(error.message);
+      }
+      return existing;
     },
   };
 
   async onModuleInit() {
     try {
-      await this.queryRows('select 1');
+      await this.supabase.from('users').select('id').limit(1);
     } catch {
       // Keep startup resilient in restricted test environments.
     }
@@ -260,32 +398,20 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
   }
 
   async $transaction<T>(callback: (tx: PrismaService) => Promise<T>): Promise<T> {
-    this.transactionStatements = [];
-    try {
-      const result = await callback(this);
-      const statements = this.transactionStatements ?? [];
-      if (statements.length > 0) {
-        await this.runRaw(`begin; ${statements.join('; ')}; commit;`);
-      }
-      this.transactionStatements = null;
-      return result;
-    } catch (error) {
-      this.transactionStatements = null;
-      throw error;
-    }
+    return callback(this);
   }
 
-  private mapUserRow(row: QueryResultRow): UserRecord {
+  private mapUserRow(row: any): UserRecord {
     return {
       id: row.id ?? '',
       email: row.email ?? '',
       phone: row.phone ?? '',
       passwordHash: row.password_hash ?? '',
       role: (row.role as Role) ?? Role.CUSTOMER,
-      isVerified: row.is_verified === 't' || row.is_verified === 'true',
-      refreshToken: row.refresh_token,
-      passwordResetTokenHash: row.password_reset_token_hash,
-      passwordResetTokenExpiresAt: row.password_reset_token_expires_at,
+      isVerified: row.is_verified === true || row.is_verified === 't' || row.is_verified === 'true',
+      refreshToken: row.refresh_token ?? null,
+      passwordResetTokenHash: row.password_reset_token_hash ?? null,
+      passwordResetTokenExpiresAt: row.password_reset_token_expires_at ?? null,
       createdAt: row.created_at ?? '',
       updatedAt: row.updated_at ?? '',
       customerProfile: null,
@@ -293,12 +419,26 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  private mapDealerProfileRow(row: QueryResultRow): DealerProfileRecord {
+  private mapDealerProfileRow(row: any): DealerProfileRecord {
     return {
       id: row.id ?? '',
       userId: row.user_id ?? '',
       businessName: row.business_name ?? '',
       status: (row.status as DealerStatus) ?? DealerStatus.PENDING_APPROVAL,
+      createdAt: row.created_at ?? '',
+      updatedAt: row.updated_at ?? '',
+    };
+  }
+
+  private mapBusinessPageRow(row: any): BusinessPageRecord {
+    return {
+      id: row.id ?? '',
+      userId: row.user_id ?? '',
+      businessName: row.business_name ?? '',
+      slug: row.slug ?? '',
+      description: row.description,
+      pagePasswordHash: row.page_password_hash,
+      status: (row.status as BusinessPageStatus) ?? BusinessPageStatus.ACTIVE,
       createdAt: row.created_at ?? '',
       updatedAt: row.updated_at ?? '',
     };
@@ -322,137 +462,58 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
       if (!enabled) continue;
       selected[key] = (hydrated as Record<string, unknown>)[key];
     }
-
     return this.clone(selected);
   }
 
   private async findCustomerProfileByUserId(userId: string) {
-    const rows = await this.queryRows(
-      `select id, user_id, full_name, address, profile_photo, driver_license_front_image, driver_license_back_image, created_at, updated_at from customer_profiles where user_id = ${this.literal(userId)} limit 1`,
-    );
-    const row = rows[0];
-    if (!row) return null;
+    const { data, error } = await this.supabase
+      .from('customer_profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) {
+      throw new Error(error.message);
+    }
+    if (!data) return null;
 
     return {
-      id: row.id ?? '',
-      userId: row.user_id ?? '',
-      fullName: row.full_name ?? '',
-      address: row.address,
-      profilePhoto: row.profile_photo,
-      driverLicenseFrontImage: row.driver_license_front_image,
-      driverLicenseBackImage: row.driver_license_back_image,
-      createdAt: row.created_at ?? '',
-      updatedAt: row.updated_at ?? '',
+      id: data.id ?? '',
+      userId: data.user_id ?? '',
+      fullName: data.full_name ?? '',
+      address: data.address,
+      profilePhoto: data.profile_photo,
+      driverLicenseFrontImage: data.driver_license_front_image,
+      driverLicenseBackImage: data.driver_license_back_image,
+      createdAt: data.created_at ?? '',
+      updatedAt: data.updated_at ?? '',
     };
   }
 
   private async findDealerProfileByUserId(userId: string) {
-    const rows = await this.queryRows(
-      `select id, user_id, business_name, status, created_at, updated_at from dealer_profiles where user_id = ${this.literal(userId)} limit 1`,
-    );
-    const row = rows[0];
-    return row ? this.mapDealerProfileRow(row) : null;
-  }
-
-  private buildWhereClause(where: { id?: string; email?: string; phone?: string }) {
-    if (where.id) return `id = ${this.literal(where.id)}`;
-    if (where.email) return `email = ${this.literal(where.email)}`;
-    if (where.phone) return `phone = ${this.literal(where.phone)}`;
-    throw new Error('No where clause provided');
+    const { data, error } = await this.supabase
+      .from('dealer_profiles')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) {
+      throw new Error(error.message);
+    }
+    return data ? this.mapDealerProfileRow(data) : null;
   }
 
   private mapUserUpdateData(data: Partial<UserRecord>) {
-    const sets: string[] = [];
-    if (data.email !== undefined) sets.push(`email = ${this.literal(data.email)}`);
-    if (data.phone !== undefined) sets.push(`phone = ${this.literal(data.phone)}`);
-    if (data.passwordHash !== undefined)
-      sets.push(`password_hash = ${this.literal(data.passwordHash)}`);
-    if (data.role !== undefined) sets.push(`role = ${this.literal(data.role)}`);
-    if (data.isVerified !== undefined) sets.push(`is_verified = ${data.isVerified}`);
-    if (data.refreshToken !== undefined)
-      sets.push(
-        data.refreshToken === null
-          ? 'refresh_token = null'
-          : `refresh_token = ${this.literal(data.refreshToken)}`,
-      );
+    const updateData: Record<string, unknown> = {};
+    if (data.email !== undefined) updateData.email = data.email;
+    if (data.phone !== undefined) updateData.phone = data.phone;
+    if (data.passwordHash !== undefined) updateData.password_hash = data.passwordHash;
+    if (data.role !== undefined) updateData.role = data.role;
+    if (data.isVerified !== undefined) updateData.is_verified = data.isVerified;
+    if (data.refreshToken !== undefined) updateData.refresh_token = data.refreshToken;
     if (data.passwordResetTokenHash !== undefined)
-      sets.push(
-        data.passwordResetTokenHash === null
-          ? 'password_reset_token_hash = null'
-          : `password_reset_token_hash = ${this.literal(data.passwordResetTokenHash)}`,
-      );
+      updateData.password_reset_token_hash = data.passwordResetTokenHash;
     if (data.passwordResetTokenExpiresAt !== undefined)
-      sets.push(
-        data.passwordResetTokenExpiresAt === null
-          ? 'password_reset_token_expires_at = null'
-          : `password_reset_token_expires_at = ${this.literal(
-              data.passwordResetTokenExpiresAt,
-            )}`,
-      );
-
-    return sets.join(', ');
-  }
-
-  private async execute(sql: string) {
-    if (this.transactionStatements) {
-      this.transactionStatements.push(sql);
-      return;
-    }
-
-    await this.runRaw(sql);
-  }
-
-  private async queryRows(sql: string): Promise<QueryResultRow[]> {
-    const output = this.runRaw(`${sql}\n`, ['-t', '-A', '-F', '\t', '-R', '\n', '-c'], true);
-    const trimmed = output.trim();
-    if (!trimmed) return [];
-
-    return trimmed.split('\n').map((line) => {
-      const cols = line.split('\t');
-      const keys = this.extractColumnNames(sql);
-      const row: QueryResultRow = {};
-      keys.forEach((key, index) => {
-        const value = cols[index];
-        row[key] = value === '' ? null : value;
-      });
-      return row;
-    });
-  }
-
-  private extractColumnNames(sql: string): string[] {
-    const selectMatch = /^select\s+(.+?)\s+from\s+/i.exec(sql.trim());
-    if (!selectMatch) {
-      return [];
-    }
-
-    return selectMatch[1]
-      .split(',')
-      .map((column) => column.trim().split(/\s+as\s+/i).pop() ?? column.trim())
-      .map((name) => name.replace(/"/g, ''));
-  }
-
-  private runRaw(
-    sql: string,
-    extraArgs: string[] = ['-t', '-A', '-F', '\t', '-R', '\n', '-c'],
-    capture = false,
-  ) {
-    const databaseUrl = this.config.get<string>('DATABASE_URL');
-    if (!databaseUrl) {
-      throw new Error('DATABASE_URL is not configured');
-    }
-
-    const args = [databaseUrl, '-v', 'ON_ERROR_STOP=1', ...extraArgs, sql];
-    const result = execFileSync('psql', args, {
-      encoding: 'utf8',
-      env: process.env,
-      stdio: capture ? 'pipe' : 'pipe',
-    });
-
-    return String(result);
-  }
-
-  private literal(value: string) {
-    return `'${value.replace(/'/g, "''")}'`;
+      updateData.password_reset_token_expires_at = data.passwordResetTokenExpiresAt;
+    return updateData;
   }
 
   private clone<T>(value: T): T {

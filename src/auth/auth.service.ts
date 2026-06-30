@@ -4,6 +4,7 @@ import {
   UnauthorizedException,
   BadRequestException,
   ForbiddenException,
+  NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
@@ -12,6 +13,7 @@ import {
   LoginDto,
   RegisterDto,
   ResetPasswordDto,
+  BecomeDealerDto,
 } from './dto/auth.dto';
 import { Role } from '../common/enums/role.enum';
 import { DealerStatus } from '../common/enums/dealer-status.enum';
@@ -101,6 +103,60 @@ export class AuthService {
         role === Role.DEALER
           ? 'Dealer account created successfully and is pending approval'
           : 'Account created successfully',
+      user: {
+        id: user.id,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+        isVerified: user.isVerified,
+      },
+      ...tokens,
+    };
+  }
+
+  async becomeDealer(userId: string, dto: BecomeDealerDto) {
+    this.assertRequiredString(dto.businessName, 'Business name is required');
+
+    const existingUser = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!existingUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (existingUser.role === Role.ADMIN) {
+      throw new BadRequestException('Admin accounts cannot become dealers');
+    }
+
+    if (existingUser.role === Role.DEALER) {
+      throw new BadRequestException('User is already a dealer');
+    }
+
+    const existingDealerProfile = await this.prisma.dealerProfile.findUnique({
+      where: { userId },
+    });
+    if (existingDealerProfile) {
+      throw new ConflictException('Dealer profile already exists');
+    }
+
+    const user = await this.prisma.$transaction(async (tx) => {
+      await tx.dealerProfile.create({
+        data: {
+          userId,
+          businessName: dto.businessName.trim(),
+          status: DealerStatus.PENDING_APPROVAL,
+        },
+      });
+
+      return tx.user.update({
+        where: { id: userId },
+        data: { role: Role.DEALER },
+      });
+    });
+
+    const tokens = await this.generateTokens(user.id, user.email, user.role);
+    await this.storeRefreshToken(user.id, tokens.refreshToken);
+
+    return {
+      message: 'Dealer profile created successfully and is pending approval',
       user: {
         id: user.id,
         email: user.email,
