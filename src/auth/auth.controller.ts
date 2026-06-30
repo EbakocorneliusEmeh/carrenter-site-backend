@@ -13,6 +13,7 @@ import {
   LoginDto,
   ForgotPasswordDto,
   ResetPasswordDto,
+  BecomeDealerDto,
 } from './dto/auth.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { JwtRefreshGuard } from '../common/guards/jwt-refresh.guard';
@@ -39,6 +40,16 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   refreshTokens(@CurrentUser() user: any) {
     return this.authService.refreshTokens(user.id, user.rawRefreshToken);
+  }
+
+  @Post('become-dealer')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  becomeDealer(
+    @CurrentUser('id') userId: string,
+    @Body() dto: BecomeDealerDto,
+  ) {
+    return this.authService.becomeDealer(userId, dto);
   }
 
   @Post('logout')

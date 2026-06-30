@@ -9,6 +9,10 @@ export class RegisterDto {
   businessName?: string;
 }
 
+export class BecomeDealerDto {
+  businessName!: string;
+}
+
 export class LoginDto {
   identifier!: string;
   password!: string;

@@ -13,6 +13,6 @@ import { RolesGuard } from '../common/guards/roles.guard';
   ],
   controllers: [AuthController],
   providers: [AuthService, TokenService, JwtAuthGuard, JwtRefreshGuard, RolesGuard],
-  exports: [AuthService, TokenService],
+  exports: [AuthService, TokenService, JwtAuthGuard, JwtRefreshGuard, RolesGuard],
 })
 export class AuthModule {}
